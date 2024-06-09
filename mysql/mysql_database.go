@@ -17,6 +17,8 @@ import (
 	"github.com/go-yaaf/yaaf-common/database"
 	"github.com/go-yaaf/yaaf-common/logger"
 	"github.com/go-yaaf/yaaf-common/messaging"
+
+	_ "github.com/go-sql-driver/mysql"
 )
 
 // region Configuration helpers ----------------------------------------------------------------------------------------
