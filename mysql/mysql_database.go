@@ -3,40 +3,71 @@ package mysql
 import (
 	"database/sql"
 	"fmt"
+	"golang.org/x/crypto/ssh"
+	"io"
+	"log"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
-	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-yaaf/yaaf-common/database"
-	. "github.com/go-yaaf/yaaf-common/entity"
 	"github.com/go-yaaf/yaaf-common/logger"
 	"github.com/go-yaaf/yaaf-common/messaging"
 )
 
+// region Configuration helpers ----------------------------------------------------------------------------------------
+
+// SSHConfig holds the SSH configuration
+type SSHConfig struct {
+	Username string
+	Password string
+	Host     string
+	Port     int
+	KeyFile  string
+}
+
+// DBConfig holds the MySQL database configuration
+type DBConfig struct {
+	Username string
+	Password string
+	Host     string
+	Port     int
+	DBName   string
+	AppName  string
+	Driver   string
+}
+
+// ConnectionString returns DNS connection
+func (c *DBConfig) ConnectionString() string {
+	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", c.Username, c.Password, c.Host, c.Port, c.DBName)
+}
+
+//endregion
+
 // region Database store definitions -----------------------------------------------------------------------------------
 
 type MySqlDatabase struct {
-	pgDb *sql.DB
-	bus  messaging.IMessageBus
-	uri  string
+	pgDb   *sql.DB               // The sql connection
+	bus    messaging.IMessageBus // Message bus for change notifications
+	uri    string                // DB connection URI
+	ssh    *ssh.Client           // SSH client (in case of connection over SSH)
+	tunnel net.Listener          // SSH tunnel (in case of connection over SSH)
 }
 
 const (
-	sqlInsert             = `INSERT INTO "%s" (id, data) VALUES ($1, $2)`
-	sqlUpdate             = `UPDATE "%s" SET data = $2 WHERE id = $1`
-	sqlUpsert             = `INSERT INTO "%s" (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = $2`
-	sqlDelete             = `DELETE FROM "%s" WHERE id = $1`
-	sqlBulkDelete         = `DELETE FROM "%s" WHERE id = ANY($1)`
-	sqlUpdateField        = `UPDATE "%s" SET data = jsonb_set(data, '{%s}', '"%s"', true) WHERE id = '%s'`
-	sqlUpdateNumericField = `UPDATE "%s" SET data = jsonb_set(data, '{%s}', '%d', true) WHERE id = '%s'`
-	ddlDropTable          = `DROP TABLE IF EXISTS "%s" CASCADE`
-	ddlCreateTable        = `CREATE TABLE IF NOT EXISTS "%s" (id character varying PRIMARY KEY NOT NULL, data jsonb NOT NULL default '{}')`
-	ddlCreateIndex        = `CREATE INDEX IF NOT EXISTS %s_%s_idx ON "%s" USING BTREE ((data->>'%s'))`
-	ddlPurgeTable         = `TRUNCATE "%s" RESTART IDENTITY CASCADE`
+	sqlInsert      = `INSERT INTO "%s" (id, data) VALUES ($1, $2)`
+	sqlUpdate      = `UPDATE "%s" SET data = $2 WHERE id = $1`
+	sqlUpsert      = `INSERT INTO "%s" (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = $2`
+	sqlDelete      = `DELETE FROM "%s" WHERE id = $1`
+	sqlBulkDelete  = `DELETE FROM "%s" WHERE id = ANY($1)`
+	ddlDropTable   = `DROP TABLE IF EXISTS "%s" CASCADE`
+	ddlCreateTable = `CREATE TABLE IF NOT EXISTS "%s" (id character varying PRIMARY KEY NOT NULL, data jsonb NOT NULL default '{}')`
+	ddlCreateIndex = `CREATE INDEX IF NOT EXISTS %s_%s_idx ON "%s" USING BTREE ((data->>'%s'))`
+	ddlPurgeTable  = `TRUNCATE "%s" RESTART IDENTITY CASCADE`
 )
 
 // endregion
@@ -47,135 +78,55 @@ const (
 //
 // param: URI - represents the database connection string in the format of: mysql://user:password@host:port/database_name?application_name
 // return: IDatabase instance, error
-func NewMySqlStore(URI string) (dbs database.IDatastore, err error) {
-
-	var (
-		driver, connStr string
-		db              *sql.DB
-	)
-
-	// Ensure driver name
-	if driver, connStr, err = convertConnectionString(URI); err != nil {
-		return nil, err
-	}
-
-	// Open connection
-	if db, err = sql.Open(driver, connStr); err != nil {
-		return nil, err
-	}
-
-	if err = db.Ping(); err != nil {
+func NewMySqlStore(URI string) (database.IDatastore, error) {
+	if db, sshCli, tunnel, err := openConnection(URI); err != nil {
 		return nil, err
 	} else {
-		dbs = &MySqlDatabase{pgDb: db, uri: URI}
+		dbs := &MySqlDatabase{
+			pgDb:   db,
+			uri:    URI,
+			ssh:    sshCli,
+			tunnel: tunnel,
+		}
+		return dbs, nil
 	}
-	return
 }
 
 // NewMySqlDatabase factory method for database
 //
 // param: URI - represents the database connection string in the format of: mysql://user:password@host:port/database_name?application_name
 // return: IDatabase instance, error
-func NewMySqlDatabase(URI string) (dbs database.IDatabase, err error) {
-
-	var (
-		driver, connStr string
-		db              *sql.DB
-	)
-
-	// Ensure driver name
-	if driver, connStr, err = convertConnectionString(URI); err != nil {
-		return nil, err
-	}
-
-	// Open connection
-	if db, err = sql.Open(driver, connStr); err != nil {
-		return nil, err
-	}
-
-	if err = db.Ping(); err != nil {
+func NewMySqlDatabase(URI string) (database.IDatabase, error) {
+	if db, sshCli, tunnel, err := openConnection(URI); err != nil {
 		return nil, err
 	} else {
-		dbs = &MySqlDatabase{pgDb: db, uri: URI}
+		dbs := &MySqlDatabase{
+			pgDb:   db,
+			uri:    URI,
+			ssh:    sshCli,
+			tunnel: tunnel,
+		}
+		return dbs, nil
 	}
-
-	return
 }
 
 // NewMySqlDatabaseWithMessageBus factory method for database with injected message bus
 //
 // param: URI - represents the database connection string in the format of: postgresql://user:password@host:port/database_name?application_name
 // return: IDatabase instance, error
-func NewMySqlDatabaseWithMessageBus(URI string, bus messaging.IMessageBus) (dbs database.IDatabase, err error) {
-
-	var (
-		driver, connStr string
-		db              *sql.DB
-	)
-
-	// Ensure driver name
-	if driver, connStr, err = convertConnectionString(URI); err != nil {
-		return nil, err
-	}
-
-	// Open connection
-	if db, err = sql.Open(driver, connStr); err != nil {
-		return nil, err
-	}
-
-	if err = db.Ping(); err != nil {
+func NewMySqlDatabaseWithMessageBus(URI string, bus messaging.IMessageBus) (database.IDatabase, error) {
+	if db, sshCli, tunnel, err := openConnection(URI); err != nil {
 		return nil, err
 	} else {
-		dbs = &MySqlDatabase{pgDb: db, bus: bus, uri: URI}
+		dbs := &MySqlDatabase{
+			pgDb:   db,
+			uri:    URI,
+			ssh:    sshCli,
+			tunnel: tunnel,
+			bus:    bus,
+		}
+		return dbs, nil
 	}
-
-	return
-}
-
-// convertConnectionString Convert URI style connection to DB connection string in the format of:
-// postgres://user:password@host:port/database_name
-// param: dbUri - The database URI
-// return: driver name, connection string, error
-func convertConnectionString(dbUri string) (driver string, connStr string, err error) {
-	uri, err := url.Parse(strings.TrimSpace(dbUri))
-	if err != nil {
-		return "", "", fmt.Errorf("URI: %s parsing failed: %s", dbUri, err.Error())
-	}
-
-	usr := uri.User.Username()
-	pwd, _ := uri.User.Password()
-
-	driver = strings.ToLower(uri.Scheme)
-
-	if driver != "mysql" {
-		return "", "", fmt.Errorf("schema for postgresql database must be: mysql")
-	}
-
-	dbName := strings.TrimPrefix(uri.Path, "/") // Remove slash
-	host, port, err := net.SplitHostPort(uri.Host)
-	if err != nil {
-		return "", "", fmt.Errorf("URI: %s host:port parsing failed: %s", dbUri, err.Error())
-	}
-
-	// Get the app name
-	appName := ""
-	params := uri.Query()
-	if _, ok := params["application_name"]; ok {
-		appName = params["application_name"][0]
-	} else if _, ok := params["ApplicationName"]; ok {
-		appName = params["ApplicationName"][0]
-	}
-
-	// if application_name parameter is not provided, get it from the executable name
-	if len(appName) == 0 {
-		executablePath := os.Args[0]            // Gets the path of the currently running executable
-		appName = filepath.Base(executablePath) // Extracts the executable name from the path
-	}
-
-	connStr = fmt.Sprintf("host=%s port=%s dbname=%s user=%s password=%s sslmode=%s application_name=%s",
-		host, port, dbName, usr, pwd, "disable", appName)
-
-	return driver, connStr, nil
 }
 
 // Ping Test database connectivity
@@ -210,7 +161,22 @@ func (dbs *MySqlDatabase) Ping(retries uint, intervalInSeconds uint) error {
 
 // Close DB and free resources
 func (dbs *MySqlDatabase) Close() error {
-	return dbs.pgDb.Close()
+
+	// Close SSH tunnel
+	if dbs.tunnel != nil {
+		_ = dbs.tunnel.Close()
+	}
+
+	// Close SSH connection
+	if dbs.ssh != nil {
+		_ = dbs.ssh.Close()
+	}
+
+	// Close database connection
+	if dbs.pgDb != nil {
+		_ = dbs.pgDb.Close()
+	}
+	return nil
 }
 
 // CloneDatabase Returns a clone (copy) of the database instance
@@ -253,769 +219,197 @@ func tableName(table string, keys ...string) (tblName string) {
 
 //endregion
 
-//endregion
-
-// region Database basic CRUD methods ----------------------------------------------------------------------------------
-
-// Get a single entity by ID
-//
-// param: factory - Entity factory
-// param: entityID - Entity id
-// param: keys - Sharding key(s) (for sharded entities and multi-tenant support)
-// return: Entity, error
-func (dbs *MySqlDatabase) Get(factory EntityFactory, entityID string, keys ...string) (result Entity, err error) {
-
-	var (
-		rows *sql.Rows
-		fe   error
-	)
-
-	result = factory()
-
-	defer func() {
-		if fe != nil {
-			if result != nil {
-				result = nil
-			}
-		}
-	}()
-
-	if entityID == "" {
-		return nil, fmt.Errorf("empty entity id passed to Get operation")
-	}
-
-	SQL := fmt.Sprintf(`SELECT id, data FROM "%s" WHERE id = $1`, tableName(result.TABLE(), keys...))
-
-	if rows, err = dbs.pgDb.Query(SQL, entityID); err != nil {
-		return nil, err
-	}
-
-	// Connection is released to pool only after rows is closed.
-	defer func() { _ = rows.Close() }()
-
-	if !rows.Next() {
-		return nil, fmt.Errorf("no row fetched for id: %s", entityID)
-	}
-
-	jsonDoc := JsonDoc{}
-	if err = rows.Scan(&jsonDoc.Id, &jsonDoc.Data); err != nil {
-		return nil, err
-	}
-
-	if err = Unmarshal([]byte(jsonDoc.Data), &result); err != nil {
-		return nil, err
-	}
-
-	return
-}
-
-// Exists Check if entity exists by ID
-//
-// param: factory - Entity factory
-// param: entityID - Entity id
-// param: keys - Sharding key(s) (for sharded entities and multi-tenant support)
-// return: bool, error
-func (dbs *MySqlDatabase) Exists(factory EntityFactory, entityID string, keys ...string) (result bool, err error) {
-
-	SQL := fmt.Sprintf(`SELECT id FROM "%s" WHERE id = $1`, tableName(factory().TABLE(), keys...))
-
-	if rows, err := dbs.pgDb.Query(SQL, entityID); err != nil {
-		return false, err
-	} else {
-		result = rows.Next()
-		_ = rows.Close()
-		return result, nil
-	}
-}
-
-// List Get list of entities by IDs
-//
-// param: factory - Entity factory
-// param: entityIDs - List of Entity IDs
-// param: keys - Sharding key(s) (for sharded entities and multi-tenant support)
-// return: []Entity, error
-func (dbs *MySqlDatabase) List(factory EntityFactory, entityIDs []string, keys ...string) (list []Entity, err error) {
-
-	var (
-		rows *sql.Rows
-	)
-
-	list = make([]Entity, 0)
-
-	// For empty list of ids, return empty list
-	if len(entityIDs) == 0 {
-		return list, nil
-	}
-
-	table := tableName(factory().TABLE(), keys...)
-	SQL := fmt.Sprintf(`SELECT id, data FROM "%s" WHERE id = ANY($1)`, table)
-	if rows, err = dbs.pgDb.Query(SQL, entityIDs); err != nil {
-		return
-	}
-	defer func() { _ = rows.Close() }()
-
-	for rows.Next() {
-		jsonDoc := JsonDoc{}
-		if err = rows.Scan(&jsonDoc.Id, &jsonDoc.Data); err != nil {
-			return
-		} else {
-			entity := factory()
-			if err = Unmarshal([]byte(jsonDoc.Data), &entity); err == nil {
-				list = append(list, entity)
-			}
-		}
-	}
-	return
-}
-
-// Insert new entity
-//
-// param: entity - The entity to insert
-// return: Inserted Entity, error
-func (dbs *MySqlDatabase) Insert(entity Entity) (added Entity, err error) {
-	var (
-		result sql.Result
-		data   []byte
-	)
-
-	tblName := tableName(entity.TABLE(), entity.KEY())
-
-	SQL := fmt.Sprintf(sqlInsert, tblName)
-	if data, err = Marshal(entity); err != nil {
-		return
-	}
-
-	if result, err = dbs.pgDb.Exec(SQL, entity.ID(), data); err != nil {
-		return
-	}
-
-	if affected, err := result.RowsAffected(); err != nil {
-		return nil, err
-	} else if affected == 0 {
-		err = fmt.Errorf("no row affected when inserting new entity")
-	}
-	added = entity
-
-	// Publish the change
-	dbs.publishChange(AddEntity, added)
-	return
-}
-
-// Update existing entity
-//
-// param: entity - The entity to update
-// return: Updated Entity, error
-func (dbs *MySqlDatabase) Update(entity Entity) (updated Entity, err error) {
-
-	var (
-		result sql.Result
-		data   []byte
-	)
-
-	tblName := tableName(entity.TABLE(), entity.KEY())
-	SQL := fmt.Sprintf(sqlUpdate, tblName)
-	if data, err = Marshal(entity); err != nil {
-		return
-	}
-
-	if result, err = dbs.pgDb.Exec(SQL, entity.ID(), data); err != nil {
-		return
-	}
-
-	var affected int64
-	if affected, err = result.RowsAffected(); err != nil {
-		return
-	} else if affected == 0 {
-		return nil, fmt.Errorf("no row affected when executing update operation")
-	}
-	updated = entity
-
-	// Publish the change
-	dbs.publishChange(UpdateEntity, entity)
-	return
-}
-
-// Upsert Update entity or insert it if it does not exist
-//
-// param: entity - The entity to update
-// return: Updated Entity, error
-func (dbs *MySqlDatabase) Upsert(entity Entity) (updated Entity, err error) {
-	var (
-		result sql.Result
-		data   []byte
-	)
-
-	tblName := tableName(entity.TABLE(), entity.KEY())
-	SQL := fmt.Sprintf(sqlUpsert, tblName)
-	if data, err = Marshal(entity); err != nil {
-		return
-	}
-
-	if result, err = dbs.pgDb.Exec(SQL, entity.ID(), data); err != nil {
-		return
-	}
-
-	var affected int64
-	if affected, err = result.RowsAffected(); err != nil {
-		return
-	} else if affected == 0 {
-		return nil, fmt.Errorf("no row affected when executing upsert operation")
-	}
-	updated = entity
-
-	// Publish the change
-	dbs.publishChange(UpdateEntity, entity)
-	return
-}
-
-// Delete entity
-//
-// param: factory - Entity factory
-// param: entityID - Entity ID to delete
-// param: keys - Sharding key(s) (for sharded entities and multi-tenant support)
-// return: error
-func (dbs *MySqlDatabase) Delete(factory EntityFactory, entityID string, keys ...string) (err error) {
-	var (
-		affected int64
-		result   sql.Result
-	)
-	entity := factory()
-
-	// Get entity
-	deleted, er := dbs.Get(factory, entityID, keys...)
-	if er != nil {
-		return er
-	}
-
-	tblName := tableName(entity.TABLE(), keys...)
-	SQL := fmt.Sprintf(sqlDelete, tblName)
-	if result, err = dbs.pgDb.Exec(SQL, entityID); err != nil {
-		return
-	}
-
-	if affected, err = result.RowsAffected(); err != nil {
-		return
-	} else if affected == 0 {
-		return fmt.Errorf("no row affected when executing delete operation")
-	}
-
-	// Publish the change
-	dbs.publishChange(DeleteEntity, deleted)
-	return
-}
-
-//endregion
-
-// region Database bulk CRUD methods -----------------------------------------------------------------------------------
-
-// BulkInsert Insert multiple entities to database in a single transaction (all must be of the same type)
-//
-// param: entities - List of entities to insert
-// return: Number of inserted entities, error
-func (dbs *MySqlDatabase) BulkInsert(entities []Entity) (affected int64, err error) {
-
-	if len(entities) == 0 {
-		return 0, nil
-	}
-
-	// Get the table
-	table := tableName(entities[0].TABLE(), entities[0].KEY())
-	valueStrings := make([]string, 0, len(entities))
-	valueArgs := make([]any, 0, len(entities)*2)
-	i := 0
-	for _, entity := range entities {
-		valueStrings = append(valueStrings, fmt.Sprintf("($%d, $%d)", i*2+1, i*2+2))
-		valueArgs = append(valueArgs, entity.ID())
-		bytes, _ := Marshal(entity)
-		valueArgs = append(valueArgs, string(bytes))
-		i++
-	}
-	SQL := fmt.Sprintf(`INSERT INTO "%s" (id, data) VALUES %s`, table, strings.Join(valueStrings, ","))
-
-	var (
-		result sql.Result
-	)
-	if result, err = dbs.pgDb.Exec(SQL, valueArgs...); err != nil {
-		return
-	}
-
-	if affected, err = result.RowsAffected(); err != nil {
-		return
-	} else if affected == 0 {
-		return affected, fmt.Errorf("no row affected when executing bulk insert operation")
-	}
-
-	// Publish the change
-	for _, entity := range entities {
-		dbs.publishChange(AddEntity, entity)
-	}
-	return
-}
-
-// BulkUpdate Update multiple entities to database in a single transaction (all must be of the same type)
-//
-// param: entities - List of entities to update
-// return: Number of updated entities, error
-func (dbs *MySqlDatabase) BulkUpdate(entities []Entity) (affected int64, err error) {
-
-	if len(entities) == 0 {
-		return 0, nil
-	}
-
-	var (
-		tx *sql.Tx
-	)
-
-	// Start transaction
-	if tx, err = dbs.pgDb.Begin(); err != nil {
-		return
-	}
-
-	// Loop over entities and update each entity within the transaction scope
-	for _, entity := range entities {
-		table := tableName(entity.TABLE(), entity.KEY())
-		SQL := fmt.Sprintf(sqlUpdate, table)
-		data, _ := Marshal(entity)
-		if _, err = dbs.pgDb.Exec(SQL, entity.ID(), data); err != nil {
-			_ = tx.Rollback()
-			return 0, err
-		}
-	}
-
-	// Commit the transaction
-	if err = tx.Commit(); err != nil {
-		return
-	} else {
-		affected = int64(len(entities))
-	}
-
-	// Publish the changes
-	for _, entity := range entities {
-		dbs.publishChange(UpdateEntity, entity)
-	}
-	return
-}
-
-// BulkUpsert Upsert multiple entities to database in a single transaction (all must be of the same type)
-//
-// param: entities - List of entities to upsert
-// return: Number of updated entities, error
-func (dbs *MySqlDatabase) BulkUpsert(entities []Entity) (affected int64, err error) {
-
-	if len(entities) == 0 {
-		return 0, nil
-	}
-
-	var (
-		tx *sql.Tx
-	)
-
-	// Start transaction
-	if tx, err = dbs.pgDb.Begin(); err != nil {
-		return
-	}
-
-	// Loop over entities and update each entity within the transaction scope
-	for _, entity := range entities {
-		table := tableName(entity.TABLE(), entity.KEY())
-		SQL := fmt.Sprintf(sqlUpsert, table)
-		data, _ := Marshal(entity)
-		if _, err = dbs.pgDb.Exec(SQL, entity.ID(), data); err != nil {
-			_ = tx.Rollback()
-			return 0, err
-		}
-	}
-
-	// Commit the transaction
-	if err = tx.Commit(); err != nil {
-		return
-	} else {
-		affected = int64(len(entities))
-	}
-
-	// Publish the changes
-	for _, entity := range entities {
-		dbs.publishChange(UpdateEntity, entity)
-	}
-	return
-}
-
-// BulkDelete Delete multiple entities from the database in a single transaction (all must be of the same type)
-//
-// param: factory - Entity factory
-// param: entityIDs - List of entities IDs to delete
-// param: keys - Sharding key(s) (for sharded entities and multi-tenant support)
-// return: Number of deleted entities, error
-func (dbs *MySqlDatabase) BulkDelete(factory EntityFactory, entityIDs []string, keys ...string) (affected int64, err error) {
-	var (
-		result sql.Result
-		entity = factory()
-	)
-
-	if len(entityIDs) == 0 {
-		return 0, nil
-	}
-
-	tblName := tableName(entity.TABLE(), keys...)
-
-	// Get the list of deleted entities (for notification)
-	deleted, e := dbs.List(factory, entityIDs, keys...)
-	if e != nil {
-		return 0, e
-	}
-
-	SQL := fmt.Sprintf(sqlBulkDelete, tblName)
-
-	if result, err = dbs.pgDb.Exec(SQL, entityIDs); err != nil {
-		return
-	}
-
-	if affected, err = result.RowsAffected(); err != nil {
-		return
-	} else if affected == 0 {
-		return 0, fmt.Errorf("no row affected when executing delete operation")
-	}
-
-	// Publish the change to the cache
-	for _, ent := range deleted {
-		dbs.publishChange(DeleteEntity, ent)
-	}
-	return
-}
-
-//endregion
-
-// region Database set field methods -----------------------------------------------------------------------------------
-
-// SetField Update a single field of the document in a single transaction
-//
-// param: factory - Entity factory
-// param: entityID - The entity ID to update the field
-// param: field - The field name to update
-// param: value - The field value to update
-// param: keys - Sharding key(s) (for sharded entities and multi-tenant support)
-// return: error
-func (dbs *MySqlDatabase) SetField(factory EntityFactory, entityID string, field string, value any, keys ...string) (err error) {
-
-	entity := factory()
-	tblName := tableName(entity.TABLE(), keys...)
-
-	SQL := fmt.Sprintf(`UPDATE "%s" SET data = jsonb_set(data, '{%s}', $1, false) WHERE id = $2`, tblName, field)
-
-	args := make([]any, 0)
-	args = append(args, value)
-	args = append(args, entityID)
-
-	if _, err = dbs.pgDb.Exec(SQL, args...); err != nil {
-		return
-	}
-
-	// Get the updated entity and publish the change
-	if updated, fer := dbs.Get(factory, entityID, keys...); fer == nil {
-		dbs.publishChange(UpdateEntity, updated)
-	}
-	return
-}
-
-// SetFields Update some fields of the document in a single transaction
-//
-// param: factory - Entity factory
-// param: entityID - The entity ID to update the field
-// param: fields - A map of field-value pairs to update
-// param: keys - Sharding key(s) (for sharded entities and multi-tenant support)
-// return: error
-func (dbs *MySqlDatabase) SetFields(factory EntityFactory, entityID string, fields map[string]any, keys ...string) (err error) {
-
-	for f, v := range fields {
-		if er := dbs.SetField(factory, entityID, f, v, keys...); er != nil {
-			return er
-		}
-	}
-	return nil
-}
-
-// BulkSetFields Update specific field of multiple entities in a single transaction (eliminates the need to fetch - change - update)
-//
-// param: factory - Entity factory
-// param: field - The field name to update
-// param: values - The map of entity Id to field value
-// param: keys - Sharding key(s) (for sharded entities and multi-tenant support)
-// return: Number of updated entities, error
-func (dbs *MySqlDatabase) BulkSetFields(factory EntityFactory, field string, values map[string]any, keys ...string) (affected int64, error error) {
-
-	if len(values) == 0 {
-		return 0, nil
-	}
-
-	// Determine the type of the field
-	sqlType := dbs.getSqlType(values)
-
-	// Create temp table to map entity to field id
-	tmpTable := fmt.Sprintf("ch%d", time.Now().UnixMilli())
-	createTmp := fmt.Sprintf("create TEMP table %s (id character varying PRIMARY KEY NOT NULL, val %s)", tmpTable, sqlType)
-	if _, err := dbs.pgDb.Exec(createTmp); err != nil {
-		return 0, err
-	}
-
-	// Bulk Insert values
-	valueStrings := make([]string, 0, len(values))
-	valueArgs := make([]any, 0, len(values)*2)
-	i := 0
-	for id, val := range values {
-		valueStrings = append(valueStrings, fmt.Sprintf("($%d, $%d)", i*2+1, i*2+2))
-		valueArgs = append(valueArgs, id)
-		valueArgs = append(valueArgs, val)
-		i++
-	}
-	SQL := fmt.Sprintf(`INSERT INTO "%s" (id, val) VALUES %s`, tmpTable, strings.Join(valueStrings, ","))
-	if _, err := dbs.pgDb.Exec(SQL, valueArgs...); err != nil {
-		return 0, err
-	}
-
-	// Create bulk update statement
-	entity := factory()
-	tblName := tableName(entity.TABLE(), keys...)
-
-	SQL = fmt.Sprintf("UPDATE %s SET data['%s'] = to_jsonb(%s.val) FROM %s WHERE %s.id = %s.id", tblName, field, tmpTable, tmpTable, tmpTable, tblName)
-
-	// Drop the temp table
-	defer func() {
-		DROP := fmt.Sprintf("DROP TABLE %s", tmpTable)
-		_, _ = dbs.pgDb.Exec(DROP)
-	}()
-
-	// Execute update
-	if result, err := dbs.pgDb.Exec(SQL); err != nil {
-		return 0, err
-	} else {
-		return result.RowsAffected()
-	}
-}
-
-// Get the SQL type of the value
-func (dbs *MySqlDatabase) getSqlType(values map[string]any) string {
-
-	typeName := "string"
-	for _, v := range values {
-		typeName = fmt.Sprintf("%T", v)
-		break
-	}
-	if strings.HasPrefix(typeName, "string") {
-		return "character varying"
-	}
-	if strings.HasPrefix(typeName, "float") {
-		return "double precision"
-	}
-	if strings.HasPrefix(typeName, "bool") {
-		return "boolean"
-	}
-
-	// For all other types (numbers, timestamp, enums) return bigint
-	return "bigint"
-}
-
-//endregion
-
-// region Database Query methods ---------------------------------------------------------------------------------------
-
-// Query Helper method to construct query
-//
-// param: factory - Entity factory
-// return: Query object
-func (dbs *MySqlDatabase) Query(factory EntityFactory) database.IQuery {
-	return &mSqlDatabaseQuery{
-		db:      dbs,
-		factory: factory,
-	}
-}
-
-//endregion
-
-// region Database DDL methods -----------------------------------------------------------------------------------------
-
-// ExecuteDDL create table and indexes
-//
-// param: ddl - The ddl parameter is a map of strings (table names) to array of strings (list of fields to index)
-// return: error
-func (dbs *MySqlDatabase) ExecuteDDL(ddl map[string][]string) (err error) {
-	for table, fields := range ddl {
-
-		SQL := fmt.Sprintf(ddlCreateTable, table)
-		if _, err = dbs.pgDb.Exec(SQL); err != nil {
-			logger.Error("%s error: %s", SQL, err.Error())
-			return
-		}
-		for _, field := range fields {
-			SQL = fmt.Sprintf(ddlCreateIndex, table, field, table, field)
-			if _, err = dbs.pgDb.Exec(SQL); err != nil {
-				logger.Error("%s error: %s", SQL, err.Error())
-				return
-			}
-		}
-	}
-	return nil
-}
-
-// ExecuteSQL Execute SQL command
-//
-// param: sql - The SQL command to execute
-// param: args - Statement arguments
-// return: Number of affected records, error
-func (dbs *MySqlDatabase) ExecuteSQL(sql string, args ...any) (int64, error) {
-	if result, err := dbs.pgDb.Exec(sql, args...); err != nil {
-		logger.Error("%s error: %s", sql, err.Error())
-		return 0, err
-	} else {
-		if a, er := result.RowsAffected(); er != nil {
-			return 0, er
-		} else {
-			return a, nil
-		}
-	}
-}
-
-// ExecuteQuery Execute native SQL query
-func (dbs *MySqlDatabase) ExecuteQuery(sql string, args ...any) ([]Json, error) {
-
-	rows, err := dbs.pgDb.Query(sql, args...)
+// region Connectivity Methods -----------------------------------------------------------------------------------------
+
+// parseConnectionString Convert URI style connection to DB connection string in the format of:
+// postgres://user:password@host:port/database_name
+// to MYSQL connection string: [username[:password]@][protocol[(address)]]/dbname[?param1=value1&...&paramN=valueN]
+// return: driver name, connection string, error
+func parseConnectionString(dbUri string) (*DBConfig, *SSHConfig, error) {
+	uri, err := url.Parse(strings.TrimSpace(dbUri))
 	if err != nil {
-		return nil, err
+		return nil, nil, fmt.Errorf("URI: %s parsing failed: %s", dbUri, err.Error())
 	}
 
-	result := make([]Json, 0)
-	for {
-		if !rows.Next() {
-			break
-		}
-
-		cols, er := rows.ColumnTypes()
-		if er != nil {
-			return nil, er
-		}
-
-		//for _, t := range cols {
-		//	st := t.ScanType()
-		//	fmt.Println(t.Name(), t.DatabaseTypeName(), st.Name())
-		//}
-
-		values := make([]any, len(cols))
-		for i, _ := range cols {
-			values[i] = new(string)
-		}
-
-		if er = rows.Scan(values...); er != nil {
-			_ = rows.Close()
-			return nil, er
-		}
-
-		entry := Json{}
-		for i, col := range cols {
-			entry[col.Name()] = values[i]
-		}
-		result = append(result, entry)
+	dbCfg := &DBConfig{}
+	dbCfg.Username = uri.User.Username()
+	dbCfg.Password, _ = uri.User.Password()
+	dbCfg.Driver = strings.ToLower(uri.Scheme)
+	if dbCfg.Driver != "mysql" {
+		return nil, nil, fmt.Errorf("schema for postgresql database must be: mysql")
 	}
 
-	return result, nil
+	dbCfg.DBName = strings.TrimPrefix(uri.Path, "/") // Remove slash
+	if host, port, er := net.SplitHostPort(uri.Host); er != nil {
+		return nil, nil, fmt.Errorf("URI: %s host:port parsing failed: %s", uri, er.Error())
+	} else {
+		dbCfg.Host = host
+		dbCfg.Port, _ = strconv.Atoi(port)
+	}
+
+	// Get the app name
+	params := uri.Query()
+	if _, ok := params["application_name"]; ok {
+		dbCfg.AppName = params["application_name"][0]
+	} else if _, ok := params["ApplicationName"]; ok {
+		dbCfg.AppName = params["ApplicationName"][0]
+	} else {
+		executablePath := os.Args[0]                  // Gets the path of the currently running executable
+		dbCfg.AppName = filepath.Base(executablePath) // Extracts the executable name from the path
+	}
+
+	// Check for connection over SSH
+	sshCfg := &SSHConfig{}
+	if _, ok := params["ssh_host"]; ok {
+		sshCfg.Host = params["ssh_host"][0]
+	} else {
+		return dbCfg, nil, nil
+	}
+	if _, ok := params["ssh_port"]; ok {
+		sshPort := params["ssh_port"][0]
+		sshCfg.Port, _ = strconv.Atoi(sshPort)
+	}
+	if _, ok := params["ssh_user"]; ok {
+		sshCfg.Username = params["ssh_user"][0]
+	}
+	if _, ok := params["ssh_pwd"]; ok {
+		sshCfg.Password = params["ssh_pwd"][0]
+	}
+	return dbCfg, sshCfg, nil
 }
 
-// DropTable Drop table and indexes
-//
-// param: table - Table name to drop
-// return: error
-func (dbs *MySqlDatabase) DropTable(table string) (err error) {
-	SQL := fmt.Sprintf(ddlDropTable, table)
-	if _, err = dbs.pgDb.Exec(SQL); err != nil {
-		logger.Error("%s error: %s", SQL, err.Error())
+// openConnection open Database connection	with / without SSH
+func openConnection(URI string) (*sql.DB, *ssh.Client, net.Listener, error) {
+
+	// Get configurations
+	dbCfg, sshCfg, err := parseConnectionString(URI)
+	if err != nil {
+		return nil, nil, nil, err
 	}
-	return
+	if sshCfg != nil {
+		return openConnectionOverSSH(dbCfg, sshCfg)
+	}
+
+	// Open standard connection
+	cli, er := sql.Open(dbCfg.Driver, dbCfg.ConnectionString())
+	if er != nil {
+		return nil, nil, nil, er
+	}
+
+	// Ping the DB to test the connection
+	er = cli.Ping()
+	if er != nil {
+		return nil, nil, nil, er
+	}
+	return cli, nil, nil, er
 }
 
-// PurgeTable Fast delete table content (truncate)
-//
-// param: table - Table name to purge
-// return: error
-func (dbs *MySqlDatabase) PurgeTable(table string) (err error) {
-	SQL := fmt.Sprintf(ddlPurgeTable, table)
-	if _, err = dbs.pgDb.Exec(SQL); err != nil {
-		logger.Error("%s error: %s", SQL, err.Error())
+func openConnectionOverSSH(dbCfg *DBConfig, sshCfg *SSHConfig) (*sql.DB, *ssh.Client, net.Listener, error) {
+
+	// Establish SSH connection
+	sshClient, err := connectSSH(sshCfg)
+	if err != nil {
+		log.Fatalf("Failed to establish SSH connection: %v", err)
 	}
-	return
+
+	// Create an SSH tunnel
+	tunnel, err := createSSHTunnel(sshClient, dbCfg)
+	if err != nil {
+		log.Fatalf("Failed to create SSH tunnel: %v", err)
+	}
+
+	// Connect to the MySQL database
+	localAddr := tunnel.Addr().String()
+	dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s", dbCfg.Username, dbCfg.Password, localAddr, dbCfg.DBName)
+	if dbs, er := sql.Open(dbCfg.Driver, dsn); er != nil {
+		return nil, nil, nil, fmt.Errorf("failed to connect to MySQL: %v", err)
+	} else {
+		return dbs, sshClient, tunnel, nil
+	}
+}
+
+// connectSSH establishes an SSH connection
+func connectSSH(config *SSHConfig) (*ssh.Client, error) {
+	var auth []ssh.AuthMethod
+	if config.Password != "" {
+		auth = append(auth, ssh.Password(config.Password))
+	} else {
+		file, err := os.Open(config.KeyFile)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = file.Close() }()
+
+		key, err := io.ReadAll(file)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read private key: %v", err)
+		}
+
+		signer, err := ssh.ParsePrivateKey(key)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse private key: %v", err)
+		}
+
+		auth = append(auth, ssh.PublicKeys(signer))
+	}
+
+	clientConfig := &ssh.ClientConfig{
+		User:            config.Username,
+		Auth:            auth,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+
+	address := fmt.Sprintf("%s:%d", config.Host, config.Port)
+	return ssh.Dial("tcp", address, clientConfig)
+}
+
+// createSSHTunnel creates an SSH tunnel for the MySQL connection
+func createSSHTunnel(client *ssh.Client, dbConfig *DBConfig) (net.Listener, error) {
+	localEndpoint := fmt.Sprintf("127.0.0.1:0")
+	remoteEndpoint := fmt.Sprintf("%s:%d", dbConfig.Host, dbConfig.Port)
+
+	listener, err := net.Listen("tcp", localEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create local listener: %v", err)
+	}
+
+	go func() {
+		for {
+			localConn, err := listener.Accept()
+			if err != nil {
+				log.Fatalf("failed to accept local connection: %v", err)
+			}
+
+			remoteConn, err := client.Dial("tcp", remoteEndpoint)
+			if err != nil {
+				log.Fatalf("failed to connect to remote endpoint: %v", err)
+			}
+
+			go func() {
+				defer func() { _ = localConn.Close() }()
+				defer func() { _ = remoteConn.Close() }()
+				copyConn(localConn, remoteConn)
+			}()
+		}
+	}()
+
+	return listener, nil
+}
+
+// copyConn copies data between two connections
+func copyConn(src, dst net.Conn) {
+	go func() {
+		defer func() { _ = src.Close() }()
+		defer func() { _ = dst.Close() }()
+		_, _ = io.Copy(src, dst)
+	}()
+	_, _ = io.Copy(dst, src)
+}
+
+// connectDB connects to the MySQL database using the SSH tunnel
+func connectDB(config DBConfig, localAddr string) (*sql.DB, error) {
+	dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s", config.Username, config.Password, localAddr, config.DBName)
+	return sql.Open("mysql", dsn)
 }
 
 //endregion
-
-// region PRIVATE SECTION ----------------------------------------------------------------------------------------------
-
-// publishChange Publish entity change to the message bus:
-//
-//	Topic: 		ENTITY_<accountId> or ENTITY_system
-//	Payload:		The entity
-//	OpCode:		1=Add, 2=Update, 3=Delete
-//	Addressee:		The entity table name
-//	SessionId:		The shard key
-//
-// param: action - The action on the entity
-// param: entity - The changed entity
-func (dbs *MySqlDatabase) publishChange(action EntityAction, entity Entity) {
-
-	if dbs.bus == nil || entity == nil {
-		return
-	}
-
-	// Set topic in the format of: ENTITY-{Table}-{Key}
-	topic := fmt.Sprintf("%s-%s-%s", messaging.EntityMessageTopic, entity.TABLE(), entity.KEY())
-	addressee := reflect.TypeOf(entity).String()
-	idx := strings.LastIndex(addressee, ".")
-	addressee = addressee[idx+1:]
-
-	if dbs.bus != nil {
-		msg := messaging.EntityMessage{
-			BaseMessage: messaging.BaseMessage{
-				MsgTopic:     topic,
-				MsgOpCode:    int(action),
-				MsgAddressee: addressee,
-				MsgSessionId: entity.ID(),
-			},
-			MsgPayload: entity,
-		}
-		if err := dbs.bus.Publish(&msg); err != nil {
-			logger.Warn("error publishing change: %s", err.Error())
-		}
-	}
-}
-
-// endregion
-
-// region Datastore  methods -------------------------------------------------------------------------------------------
-
-// IndexExists tests if index exists
-func (dbs *MySqlDatabase) IndexExists(indexName string) (exists bool) {
-	// TODO: Add implementation
-	return false
-}
-
-// CreateIndex creates an index (without mapping)
-func (dbs *MySqlDatabase) CreateIndex(indexName string) (name string, err error) {
-	// TODO: Add implementation
-	return indexName, fmt.Errorf("not implemented")
-}
-
-// CreateEntityIndex creates an index of entity and add entity field mapping
-func (dbs *MySqlDatabase) CreateEntityIndex(factory EntityFactory, key string) (name string, err error) {
-	// TODO: Add implementation
-	return key, fmt.Errorf("not implemented")
-}
-
-// ListIndices returns a list of all indices matching the pattern
-func (dbs *MySqlDatabase) ListIndices(pattern string) (map[string]int, error) {
-	// TODO: Add implementation
-	return nil, fmt.Errorf("not implemented")
-}
-
-// DropIndex drops an index
-func (dbs *MySqlDatabase) DropIndex(indexName string) (ack bool, err error) {
-	// TODO: Add implementation
-	return false, fmt.Errorf("not implemented")
-}
-
-// endregion

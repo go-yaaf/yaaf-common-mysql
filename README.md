@@ -4,6 +4,8 @@
 
 MySQL object database implementation of `yaaf-common` IDatabase interface
 
+IMPORTANT: This is a partial implementation only used for data transfer only! not ready for production!!
+
 ## About
 This library is the MySQL concrete implementation of the ORM layer defined in the `IDatabase` interface in `yaaf-common` library.
 This implementation refers to the object database concepts only, the underlying database includes table per domain model entity,
