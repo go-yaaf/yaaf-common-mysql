@@ -675,7 +675,11 @@ func (dbs *MySqlDatabase) ExecuteQuery(sql string, args ...any) ([]Json, error) 
 				v = val
 			}
 
-			entry[col] = v
+			// Do not override values already exists
+			if _, hasValue := entry[col]; !hasValue {
+				entry[col] = v
+			}
+
 		}
 		result = append(result, entry)
 	}
