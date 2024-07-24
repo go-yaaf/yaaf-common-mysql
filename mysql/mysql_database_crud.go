@@ -633,7 +633,7 @@ func (dbs *MySqlDatabase) ExecuteSQL(sql string, args ...any) (int64, error) {
 }
 
 // ExecuteQuery Execute native SQL query
-func (dbs *MySqlDatabase) ExecuteQuery(sql string, args ...any) ([]Json, error) {
+func (dbs *MySqlDatabase) ExecuteQuery(source, sql string, args ...any) ([]Json, error) {
 
 	rows, err := dbs.pgDb.Query(sql, args...)
 	if err != nil {

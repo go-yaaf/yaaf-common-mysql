@@ -35,7 +35,7 @@ func TestMySqlDatabaseOverSsh(t *testing.T) {
 	require.NoError(t, err)
 
 	query := fmt.Sprintf("select * from table_name limit %d", 100)
-	list, er := db.ExecuteQuery(query)
+	list, er := db.ExecuteQuery("", query)
 	require.NoError(t, er)
 
 	for _, row := range list {
