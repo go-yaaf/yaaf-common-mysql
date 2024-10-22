@@ -668,16 +668,88 @@ func (dbs *MySqlDatabase) ExecuteQuery(source, sql string, args ...any) ([]Json,
 			val := values[i]
 
 			// If the column is null, set the value to nil
-			b, ok := val.([]byte)
-			if ok {
-				v = string(b)
-			} else {
-				v = val
+			switch t := val.(type) {
+			case int:
+				v = t
+			case int64:
+				v = t
+			case string:
+				v = t
+			case []byte:
+				v = string(t)
+			default:
+				v = t
 			}
+
+			//b, ok := val.([]byte)
+			//if ok {
+			//	v = string(b)
+			//} else {
+			//	v = val
+			//}
 
 			// Do not override values already exists
 			if _, hasValue := entry[col]; !hasValue {
 				entry[col] = v
+			}
+
+		}
+		result = append(result, entry)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating over rows: %v", err)
+	}
+
+	return result, nil
+}
+
+// ExecuteQueryNew Execute native SQL query
+func (dbs *MySqlDatabase) ExecuteQueryNew(source, sql string, args ...any) ([]Json, error) {
+
+	rows, err := dbs.pgDb.Query(sql, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get column names
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get column names: %v", err)
+	}
+
+	colTypes, err := rows.ColumnTypes()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get column types: %v", err)
+	}
+
+	// Prepare a slice of interface{}'s to represent each column, and a second slice to contain pointers to each item in the columns slice
+	values := make([]any, 0)
+	valuePtrs := make([]any, 0)
+
+	for _, ct := range colTypes {
+		dbType := ct.DatabaseTypeName()
+		val := dbs.createPlaceHolder(dbType)
+		values = append(values, val)
+		valuePtrs = append(valuePtrs, &val)
+	}
+
+	result := make([]Json, 0)
+
+	// Iterate over the rows
+	for rows.Next() {
+		// Scan the result into the column pointers
+		if er := rows.Scan(valuePtrs...); er != nil {
+			return nil, fmt.Errorf("failed to scan row: %v", er)
+		}
+		// Create a map and populate it with the row data
+		entry := Json{}
+		for i, col := range columns {
+			//var v any
+			//val := values[i]
+
+			// Do not override values already exists
+			if _, hasValue := entry[col]; !hasValue {
+				entry[col] = values[i]
 			}
 
 		}
@@ -712,6 +784,30 @@ func (dbs *MySqlDatabase) PurgeTable(table string) (err error) {
 		logger.Error("%s error: %s", SQL, err.Error())
 	}
 	return
+}
+
+func (dbs *MySqlDatabase) createPlaceHolder(dbTypeName string) any {
+	switch dbTypeName {
+	case "CHAR":
+		return ""
+	case "VARCHAR":
+		return ""
+	case "TEXT":
+		return ""
+	case "DATETIME":
+		return int64(0)
+	case "DATE":
+		return int64(0)
+	case "TINYINT":
+		return int64(0)
+	case "INT":
+		return int64(0)
+	case "DECIMAL":
+		return float64(0)
+
+	}
+	logger.Error("Unhandled DB type: %s, convert to string", dbTypeName)
+	return ""
 }
 
 //endregion
