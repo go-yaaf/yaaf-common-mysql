@@ -587,6 +587,10 @@ func (dbs *MySqlDatabase) Query(factory EntityFactory) database.IQuery {
 	}
 }
 
+func (dbs *MySqlDatabase) AdvancedQuery(factory EntityFactory) database.IAdvancedQuery {
+	panic("MySqlDatabase: IAdvancedQuery is not implemented/supported")
+}
+
 //endregion
 
 // region Database DDL methods -----------------------------------------------------------------------------------------
