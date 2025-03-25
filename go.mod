@@ -2,11 +2,9 @@ module github.com/go-yaaf/yaaf-common-mysql
 
 go 1.22
 
-toolchain go1.22.2
-
 require (
 	github.com/go-sql-driver/mysql v1.8.1
-	github.com/go-yaaf/yaaf-common v1.2.141
+	github.com/go-yaaf/yaaf-common v1.2.148
 	github.com/stretchr/testify v1.10.0
 	golang.org/x/crypto v0.32.0
 )
