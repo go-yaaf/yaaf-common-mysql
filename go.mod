@@ -4,7 +4,7 @@ go 1.24.0
 
 require (
 	github.com/go-sql-driver/mysql v1.9.3
-	github.com/go-yaaf/yaaf-common v1.2.180
+	github.com/go-yaaf/yaaf-common v1.2.181
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/crypto v0.46.0
 )
